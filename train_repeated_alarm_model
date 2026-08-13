@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+"""
+Train repeated alarm prediction model — v6 (schema-aligned).
+
+Key changes from v5:
+  C1.  Column names now exactly match the PostgreSQL alarm_data schema:
+         id, time, type, status, threat_level, resolved_on, fibre_line,
+         position_m, latitude, longitude, route, route_distance_m,
+         marker_name, occurrence_type, record_id
+       No more alias guessing — canonical names are the DB column names.
+
+  C2.  New feature: resolution_time_hours — derived from resolved_on - time.
+       Long resolution = chronic / complex alarms → stronger repeat signal.
+
+  C3.  New feature: unresolved_share per pattern-month — ratio of alarms
+       with no resolved_on value. Persistent open alarms indicate hotspots.
+
+  C4.  New feature: status distribution — share of each status value
+       (e.g., "Active", "Resolved", "Pending") as numeric ratios per bin.
+
+  C5.  fibre_line as a categorical grouping feature (replaces FibreLine alias).
+       Added to FEATURES and CATEGORICAL for OHE treatment.
+
+  C6.  occurrence_type split improved — dedicated accident_count, alarm_count,
+       and alarm_share features, now sourced from the correct column name.
+
+  C7.  threat_level ordinal encoding preserved (Low=1, Medium=2, High/Red=3).
+
+  C8.  record_id used only for deduplication on load (drop duplicates by PK).
+
+  C9.  resolved_on parsed as timestamp; NaT = still open.
+
+  C10. All column references use snake_case to match DB exactly.
+
+  C11. Logging improved — prints actual column names found in DB on startup.
+
+  C12. Output CSV columns updated to reflect new feature names.
+
+Run:
+    pip install pandas numpy scikit-learn joblib sqlalchemy psycopg2-binary
+    python train_repeated_alarm_model_v6.py
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+import warnings
+from itertools import product
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    VotingClassifier,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+PROJECT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR  = PROJECT_DIR
+
+DB_URL = os.getenv("DAS_DB_URL")
+if not DB_URL:
+    raise RuntimeError(
+        "DAS_DB_URL is not set. "
+        "PowerShell example: $env:DAS_DB_URL = 'postgresql://USER:PASSWORD@HOST:5432/DBNAME'"
+    )
+DB_TABLE = "alarm_data"
+
+# ── DB column names (exact snake_case from schema) ──────────────────
+# id, time, type, status, threat_level, resolved_on, fibre_line,
+# position_m, latitude, longitude, route, route_distance_m,
+# marker_name, occurrence_type, record_id
+
+POSITION_BIN_SIZE    = 5_000
+RANDOM_STATE         = 42
+MAX_CV_FOLDS         = 5
+RECENCY_HALF_LIFE    = 6
+THRESHOLD_GRID       = np.arange(0.20, 0.81, 0.01)
+ENSEMBLE_MARGIN      = 0.02
+MIN_ROWS_ISOTONIC    = 300
+MIN_MONTHS_ISOTONIC  = 4
+MIN_ROWS_SIGMOID     = 200
+MIN_MONTHS_SIGMOID   = 3
+
+np.random.seed(RANDOM_STATE)
+
+# ──────────────────────────────────────────────
+# THREAT LEVEL ENCODING  (C7)
+# ──────────────────────────────────────────────
+THREAT_ORDER = {"low": 1, "medium": 2, "high": 3, "red": 3, "orange": 2, "critical": 3}
+
+
+def _encode_threat(val) -> float:
+    if pd.isna(val):
+        return 2.0
+    return float(THREAT_ORDER.get(str(val).strip().lower(), 2.0))
+
+
+# ──────────────────────────────────────────────
+# POSITION RANGE LABEL
+# ──────────────────────────────────────────────
+def _pos_range_label(bin_idx: int, bin_size: int = POSITION_BIN_SIZE) -> str:
+    start = int(bin_idx) * bin_size
+    end   = start + bin_size - 1
+    return f"{start:,}–{end:,} m"
+
+
+# ──────────────────────────────────────────────
+# DATA LOADING  (C1, C8)
+# ──────────────────────────────────────────────
+def load_data_from_db() -> pd.DataFrame:
+    log.info("Connecting to PostgreSQL → table: %s", DB_TABLE)
+    engine = create_engine(DB_URL)
+    df = pd.read_sql(f"SELECT * FROM {DB_TABLE}", engine)
+    df.columns = df.columns.str.strip().str.lower()
+
+    log.info("Raw rows: %d  |  columns: %s", len(df), list(df.columns))
+
+    # Deduplicate on primary key  (C8)
+    if "record_id" in df.columns:
+        before = len(df)
+        df = df.drop_duplicates(subset=["record_id"])
+        log.info("Dropped %d duplicate record_id rows.", before - len(df))
+
+    return df
+
+
+def _safe_write(df: pd.DataFrame, path: Path, **kwargs) -> Path:
+    try:
+        df.to_csv(path, index=False, **kwargs)
+        return path
+    except PermissionError:
+        alt = path.with_name(
+            f"{path.stem}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}"
+        )
+        df.to_csv(alt, index=False, **kwargs)
+        log.warning("PermissionError on %s — saved as %s", path.name, alt.name)
+        return alt
+
+
+# ──────────────────────────────────────────────
+# DATA PREPARATION  (C1–C10)
+# ──────────────────────────────────────────────
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # ── Required columns (exact DB names) ────────────────────────────
+    required = ["time", "type", "route", "position_m"]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required DB columns: {missing}\n"
+            f"Found columns: {list(df.columns)}"
+        )
+
+    # ── Parse timestamps  (C9) ────────────────────────────────────────
+    df["time"]        = pd.to_datetime(df["time"],        errors="coerce", utc=False)
+    df["resolved_on"] = pd.to_datetime(df.get("resolved_on"), errors="coerce", utc=False) \
+                        if "resolved_on" in df.columns else pd.NaT
+
+    # ── Numeric fields ────────────────────────────────────────────────
+    df["position_m"]      = pd.to_numeric(df["position_m"],      errors="coerce")
+    df["latitude"]        = pd.to_numeric(df.get("latitude"),    errors="coerce")
+    df["longitude"]       = pd.to_numeric(df.get("longitude"),   errors="coerce")
+    df["route_distance_m"]= pd.to_numeric(df.get("route_distance_m"), errors="coerce")
+
+    # ── Optional text fields ──────────────────────────────────────────
+    for col in ["status", "threat_level", "fibre_line", "marker_name", "occurrence_type"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # ── Drop rows missing key fields ──────────────────────────────────
+    df = df.dropna(subset=["time", "route", "type", "position_m"])
+    df["route"] = df["route"].astype(str).str.strip()
+    df["type"]  = df["type"].astype(str).str.strip()
+    df = df[(df["route"] != "") & (df["type"] != "") & (df["position_m"] >= 0)].copy()
+
+    # ── Time features ─────────────────────────────────────────────────
+    df["month"]      = df["time"].dt.to_period("M").dt.to_timestamp()
+    df["month_num"]  = df["time"].dt.month
+    df["hour"]       = df["time"].dt.hour
+    df["dayofweek"]  = df["time"].dt.dayofweek
+    df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
+    df["is_peak"]    = df["hour"].between(6, 17).astype(int)
+
+    # ── Spatial bin ───────────────────────────────────────────────────
+    df["position_bin"]   = (df["position_m"] // POSITION_BIN_SIZE).astype(int)
+    df["position_start"] = df["position_bin"] * POSITION_BIN_SIZE
+    df["position_end"]   = df["position_start"] + POSITION_BIN_SIZE - 1
+    df["position_range"] = df["position_bin"].apply(
+        lambda b: _pos_range_label(int(b), POSITION_BIN_SIZE)
+    )
+
+    # ── Threat level ordinal  (C7) ────────────────────────────────────
+    df["threat_score"] = df["threat_level"].apply(_encode_threat)
+
+    # ── Occurrence type: 1 = accident  (C6) ──────────────────────────
+    df["is_accident"] = (
+        df["occurrence_type"].astype(str).str.strip().str.lower() == "accident"
+    ).astype(int)
+
+    # ── Resolution time  (C2) ─────────────────────────────────────────
+    df["resolution_hours"] = np.where(
+        df["resolved_on"].notna() & df["time"].notna(),
+        (df["resolved_on"] - df["time"]).dt.total_seconds() / 3600,
+        np.nan,
+    )
+    # Negative or extreme values are data errors; clip to 0–8760 h (1 year)
+    df["resolution_hours"] = df["resolution_hours"].clip(lower=0, upper=8760)
+
+    # ── Unresolved flag  (C3) ─────────────────────────────────────────
+    df["is_unresolved"] = df["resolved_on"].isna().astype(int)
+
+    # ── Status flags  (C4) ────────────────────────────────────────────
+    df["status_clean"] = df["status"].astype(str).str.strip().str.lower().fillna("unknown")
+
+    # ── fibre_line as grouping dimension  (C5) ────────────────────────
+    df["fibre_line"] = df["fibre_line"].astype(str).str.strip().fillna("unknown")
+
+    log.info(
+        "After cleaning: %d rows | date range: %s → %s",
+        len(df), df["time"].min(), df["time"].max(),
+    )
+    return df
+
+
+# ──────────────────────────────────────────────
+# MONTHLY FEATURE TABLE
+# ──────────────────────────────────────────────
+def _most_common_hour(x: pd.Series) -> int:
+    clean = x.dropna()
+    return int(clean.value_counts().index[0]) if len(clean) else 0
+
+
+def _most_common_status(x: pd.Series) -> str:
+    clean = x.dropna()
+    return str(clean.value_counts().index[0]) if len(clean) else "unknown"
+
+
+def build_monthly_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    group_cols = ["route", "type", "position_bin", "month"]
+
+    monthly = (
+        df.groupby(group_cols)
+        .agg(
+            alarm_count         = ("type",              "size"),
+            accident_count      = ("is_accident",       "sum"),
+            unresolved_count    = ("is_unresolved",     "sum"),   # C3
+            avg_resolution_hrs  = ("resolution_hours",  "mean"),  # C2
+            max_resolution_hrs  = ("resolution_hours",  "max"),   # C2
+            avg_hour            = ("hour",              "mean"),
+            std_hour            = ("hour",              "std"),
+            most_common_hour    = ("hour",              _most_common_hour),
+            peak_hour_share     = ("is_peak",           "mean"),
+            weekend_share       = ("is_weekend",        "mean"),
+            avg_threat_score    = ("threat_score",      "mean"),
+            max_threat_score    = ("threat_score",      "max"),
+            active_days         = ("time",              lambda x: x.dt.date.nunique()),
+            distinct_markers    = ("marker_name",       "nunique"),
+            dominant_status     = ("status_clean",      _most_common_status),  # C4
+            dominant_fibre      = ("fibre_line",        lambda x: x.mode().iloc[0] if len(x) else "unknown"),  # C5
+            avg_lat             = ("latitude",          "mean"),
+            avg_lon             = ("longitude",         "mean"),
+            avg_route_dist      = ("route_distance_m",  "mean"),
+        )
+        .reset_index()
+    )
+
+    # ── Derived per-pattern-month ratios ──────────────────────────────
+    monthly["std_hour"]           = monthly["std_hour"].fillna(0)
+    monthly["avg_lat"]            = monthly["avg_lat"].fillna(0)
+    monthly["avg_lon"]            = monthly["avg_lon"].fillna(0)
+    monthly["avg_route_dist"]     = monthly["avg_route_dist"].fillna(0)
+    monthly["avg_resolution_hrs"] = monthly["avg_resolution_hrs"].fillna(
+        monthly["avg_resolution_hrs"].median()
+    )
+    monthly["max_resolution_hrs"] = monthly["max_resolution_hrs"].fillna(0)
+
+    # alarm_share: fraction that are alarms (not accidents)  (C6)
+    monthly["alarm_share"] = (
+        monthly["alarm_count"] /
+        (monthly["alarm_count"] + monthly["accident_count"]).replace(0, 1)
+    )
+    # unresolved_share  (C3)
+    monthly["unresolved_share"] = (
+        monthly["unresolved_count"] / monthly["alarm_count"].replace(0, 1)
+    )
+
+    # Cyclical month encoding
+    monthly["month_num"] = monthly["month"].dt.month
+    monthly["month_sin"] = np.sin(2 * np.pi * monthly["month_num"] / 12)
+    monthly["month_cos"] = np.cos(2 * np.pi * monthly["month_num"] / 12)
+
+    monthly = monthly.sort_values(
+        ["route", "type", "position_bin", "month"]
+    ).reset_index(drop=True)
+
+    pattern_cols = ["route", "type", "position_bin"]
+    grp = monthly.groupby(pattern_cols, group_keys=False)
+
+    # ── Lag features ──────────────────────────────────────────────────
+    for lag, name in [(1, "prev_month_count"), (2, "prev2_month_count"),
+                      (3, "prev3_month_count")]:
+        monthly[name] = grp["alarm_count"].shift(lag).fillna(0)
+
+    # Resolution time lags  (C2)
+    monthly["prev_avg_resolution_hrs"] = grp["avg_resolution_hrs"].shift(1).fillna(0)
+
+    # ── Rolling stats ─────────────────────────────────────────────────
+    def _roll(s, win, fn):
+        return getattr(
+            s.shift(1).rolling(window=win, min_periods=1), fn
+        )().fillna(0)
+
+    monthly["roll3_mean"]  = grp["alarm_count"].transform(lambda s: _roll(s, 3, "mean"))
+    monthly["roll3_std"]   = grp["alarm_count"].transform(lambda s: _roll(s, 3, "std"))
+    monthly["roll6_mean"]  = grp["alarm_count"].transform(lambda s: _roll(s, 6, "mean"))
+    monthly["roll6_std"]   = grp["alarm_count"].transform(lambda s: _roll(s, 6, "std"))
+
+    # Rolling unresolved share  (C3)
+    monthly["roll3_unresolved"] = grp["unresolved_share"].transform(
+        lambda s: _roll(s, 3, "mean")
+    )
+
+    # ── EWMA ──────────────────────────────────────────────────────────
+    monthly["ewma3_count"] = grp["alarm_count"].transform(
+        lambda s: s.shift(1).ewm(span=3, min_periods=1, adjust=False).mean().fillna(0)
+    )
+
+    # ── Momentum ──────────────────────────────────────────────────────
+    monthly["momentum_diff"] = monthly["roll3_mean"] - monthly["roll6_mean"]
+
+    # ── Cumulative (past only) ─────────────────────────────────────────
+    monthly["past_total_count"]   = grp["alarm_count"].cumsum() - monthly["alarm_count"]
+    monthly["past_months_active"] = grp.cumcount()
+    monthly["past_avg_count"]     = np.where(
+        monthly["past_months_active"] > 0,
+        monthly["past_total_count"] / monthly["past_months_active"],
+        0,
+    )
+
+    # ── Active ratio ──────────────────────────────────────────────────
+    all_months   = np.sort(monthly["month"].unique())
+    month_to_idx = {m: i for i, m in enumerate(all_months)}
+    monthly["months_observed"] = monthly["month"].map(month_to_idx).astype(float)
+    monthly["active_ratio"]    = np.where(
+        monthly["months_observed"] > 0,
+        monthly["past_months_active"] / monthly["months_observed"],
+        0,
+    )
+
+    monthly["had_prev_month"]         = (monthly["prev_month_count"] > 0).astype(int)
+    monthly["trend_diff"]             = monthly["prev_month_count"] - monthly["prev2_month_count"]
+    monthly["months_since_last_seen"] = np.where(
+        monthly["past_months_active"] == 0, 999,
+        np.where(monthly["prev_month_count"] > 0, 0, 1),
+    )
+    monthly["months_since_first_seen"] = monthly["months_observed"]
+
+    # ── Cross-pattern: route+type popularity ──────────────────────────
+    rt_month = (
+        monthly.groupby(["route", "type", "month"])["alarm_count"]
+        .sum().reset_index().rename(columns={"alarm_count": "_rt_total"})
+    )
+    rt_month = rt_month.sort_values(["route", "type", "month"])
+    rt_month["route_type_popularity"] = (
+        rt_month.groupby(["route", "type"], group_keys=False)["_rt_total"]
+        .shift(1).fillna(0)
+    )
+    monthly = monthly.merge(
+        rt_month[["route", "type", "month", "route_type_popularity"]],
+        on=["route", "type", "month"], how="left",
+    )
+    monthly["route_type_popularity"] = monthly["route_type_popularity"].fillna(0)
+
+    # ── Neighbour-bin activity ─────────────────────────────────────────
+    lookup = monthly.set_index(["route", "type", "position_bin", "month"])["alarm_count"]
+
+    def _neighbor_sum(route, ev_type, bin_idx, prev_m):
+        total = 0.0
+        for delta in (-1, 1):
+            key = (route, ev_type, bin_idx + delta, prev_m)
+            if key in lookup.index:
+                total += float(lookup.loc[key])
+        return total
+
+    monthly["_prev_month"] = grp["month"].shift(1)
+    has_prev = monthly["_prev_month"].notna()
+    monthly["neighbor_bin_count"] = 0.0
+    if has_prev.any():
+        vals = monthly.loc[has_prev].apply(
+            lambda r: _neighbor_sum(
+                r["route"], r["type"], int(r["position_bin"]), r["_prev_month"]
+            ),
+            axis=1,
+        )
+        monthly.loc[has_prev, "neighbor_bin_count"] = vals.values
+    monthly.drop(columns=["_prev_month"], inplace=True)
+
+    # ── Target ────────────────────────────────────────────────────────
+    monthly["next_month_count"]  = grp["alarm_count"].shift(-1).fillna(0)
+    monthly["repeat_next_month"] = (monthly["next_month_count"] > 0).astype(int)
+
+    latest_month = monthly["month"].max()
+    train_ready  = monthly[monthly["month"] < latest_month].copy()
+
+    return train_ready, monthly
+
+
+# ──────────────────────────────────────────────
+# FEATURE DEFINITION
+# ──────────────────────────────────────────────
+FEATURES = [
+    # Identity
+    "route", "type", "position_bin",
+    # fibre_line grouping  (C5)
+    "dominant_fibre",
+    # Cyclic time
+    "month_num", "month_sin", "month_cos",
+    # Event counts  (C6)
+    "alarm_count", "accident_count", "alarm_share",
+    # Time-of-day
+    "avg_hour", "std_hour", "most_common_hour",
+    "peak_hour_share", "weekend_share",
+    # Threat  (C7)
+    "avg_threat_score", "max_threat_score",
+    # Resolution time  (C2)
+    "avg_resolution_hrs", "max_resolution_hrs", "prev_avg_resolution_hrs",
+    # Unresolved  (C3)
+    "unresolved_count", "unresolved_share", "roll3_unresolved",
+    # Status  (C4)
+    "dominant_status",
+    # Spatial
+    "avg_lat", "avg_lon", "avg_route_dist", "distinct_markers",
+    # Activity
+    "active_days",
+    # Lags
+    "prev_month_count", "prev2_month_count", "prev3_month_count",
+    # Rolling
+    "roll3_mean", "roll3_std", "roll6_mean", "roll6_std",
+    # EWMA / momentum
+    "ewma3_count", "momentum_diff",
+    # Cumulative
+    "past_total_count", "past_months_active", "past_avg_count", "active_ratio",
+    # Recency
+    "had_prev_month", "trend_diff",
+    "months_since_last_seen", "months_since_first_seen",
+    # Cross-pattern
+    "route_type_popularity", "neighbor_bin_count",
+]
+
+CATEGORICAL = ["route", "type", "dominant_fibre", "dominant_status"]
+TARGET      = "repeat_next_month"
+
+
+# ──────────────────────────────────────────────
+# PREPROCESSOR
+# ──────────────────────────────────────────────
+def make_preprocessor() -> ColumnTransformer:
+    numeric_feats = [c for c in FEATURES if c not in CATEGORICAL]
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ])
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot",  OneHotEncoder(handle_unknown="ignore", min_frequency=2)),
+    ])
+    return ColumnTransformer([
+        ("num", num_pipe, numeric_feats),
+        ("cat", cat_pipe, CATEGORICAL),
+    ])
+
+
+# ──────────────────────────────────────────────
+# CANDIDATE MODELS
+# ──────────────────────────────────────────────
+def candidate_models():
+    return [
+        (
+            "HistGradientBoosting",
+            HistGradientBoostingClassifier(
+                random_state=RANDOM_STATE, class_weight="balanced",
+            ),
+            {
+                "model__max_iter":          [200, 400],
+                "model__max_depth":         [4, 6, 8],
+                "model__learning_rate":     [0.05, 0.1],
+                "model__min_samples_leaf":  [10, 20],
+                "model__l2_regularization": [0.0, 0.1],
+            },
+        ),
+        (
+            "RandomForest",
+            RandomForestClassifier(
+                random_state=RANDOM_STATE, n_jobs=-1, class_weight="balanced",
+            ),
+            {
+                "model__n_estimators":     [300, 500],
+                "model__max_depth":        [6, 8, 10],
+                "model__min_samples_leaf": [3, 5],
+                "model__max_features":     ["sqrt", 0.5],
+                "model__ccp_alpha":        [0.0, 0.001],
+            },
+        ),
+        (
+            "GradientBoosting",
+            GradientBoostingClassifier(random_state=RANDOM_STATE),
+            {
+                "model__n_estimators":     [200, 300],
+                "model__max_depth":        [2, 3],
+                "model__learning_rate":    [0.05, 0.1],
+                "model__min_samples_leaf": [5, 10],
+                "model__subsample":        [0.8, 1.0],
+            },
+        ),
+        (
+            "LogisticRegression",
+            LogisticRegression(
+                max_iter=3000, class_weight="balanced", random_state=RANDOM_STATE,
+            ),
+            {
+                "model__C":       [0.1, 0.5, 1.0, 3.0],
+                "model__penalty": ["l2"],
+            },
+        ),
+    ]
+
+
+# ──────────────────────────────────────────────
+# RECENCY WEIGHTS
+# ──────────────────────────────────────────────
+def recency_weights(months: pd.Series, half_life: int = RECENCY_HALF_LIFE) -> np.ndarray:
+    months    = pd.to_datetime(months)
+    max_month = months.max()
+    delta     = (
+        (max_month.year - months.dt.year) * 12 +
+        (max_month.month - months.dt.month)
+    ).astype(float)
+    return np.power(0.5, delta / half_life)
+
+
+# ──────────────────────────────────────────────
+# TIME-SERIES CV
+# ──────────────────────────────────────────────
+def ts_cv_score(pipeline, X, y, months, n_splits, sample_weight=None):
+    unique_months = np.sort(months.unique())
+    if len(unique_months) < 2:
+        return -np.inf, []
+    n_splits    = min(n_splits, len(unique_months) - 1)
+    fold_scores = []
+
+    for i in range(n_splits):
+        val_month  = unique_months[len(unique_months) - n_splits + i]
+        train_mask = months < val_month
+        val_mask   = months == val_month
+        if train_mask.sum() == 0 or val_mask.sum() == 0:
+            continue
+        try:
+            sw = sample_weight[train_mask] if sample_weight is not None else None
+            if sw is not None:
+                pipeline.fit(X[train_mask], y[train_mask], model__sample_weight=sw)
+            else:
+                pipeline.fit(X[train_mask], y[train_mask])
+        except TypeError:
+            pipeline.fit(X[train_mask], y[train_mask])
+
+        prob     = pipeline.predict_proba(X[val_mask])[:, 1]
+        best_f1  = 0.0
+        best_t   = 0.5
+        for t in THRESHOLD_GRID:
+            sc = f1_score(y[val_mask], (prob >= t).astype(int), zero_division=0)
+            if sc > best_f1:
+                best_f1, best_t = sc, t
+        fold_scores.append((val_month, best_f1, best_t))
+
+    if not fold_scores:
+        return -np.inf, []
+    return float(np.mean([s[1] for s in fold_scores])), fold_scores
+
+
+def small_grid_search(estimator, param_grid, X, y, months, n_splits, sample_weight=None):
+    keys   = list(param_grid.keys())
+    combos = list(product(*[param_grid[k] for k in keys]))
+    best_score, best_params, best_pipe = -np.inf, None, None
+
+    for combo in combos:
+        params = dict(zip(keys, combo))
+        pipe   = Pipeline([
+            ("preprocessor", make_preprocessor()),
+            ("model",        clone(estimator)),
+        ])
+        pipe.set_params(**params)
+        score, _ = ts_cv_score(pipe, X, y, months, n_splits, sample_weight)
+        if score > best_score:
+            best_score, best_params, best_pipe = score, params, pipe
+
+    return best_pipe, best_params, best_score
+
+
+# ──────────────────────────────────────────────
+# COLD-START (single-month)
+# ──────────────────────────────────────────────
+class ColdStartPredictor:
+    def __init__(self, threshold: float = 0.5):
+        self.threshold   = threshold
+        self._max_count: float = 1.0
+
+    def fit(self, df: pd.DataFrame):
+        self._max_count = max(float(df["alarm_count"].max()), 1.0)
+        return self
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        p = np.clip(
+            df["alarm_count"].fillna(0).values.astype(float) / self._max_count,
+            0, 1,
+        )
+        return np.column_stack([1 - p, p])
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        return (self.predict_proba(df)[:, 1] >= self.threshold).astype(int)
+
+
+# ──────────────────────────────────────────────
+# TRAIN
+# ──────────────────────────────────────────────
+def train_model(train_df: pd.DataFrame):
+    if train_df.empty:
+        raise ValueError("Training table is empty — not enough data.")
+
+    X       = train_df[FEATURES].copy()
+    y       = train_df[TARGET].copy()
+    months  = train_df["month"]
+    weights = recency_weights(months)
+
+    unique_months = np.sort(months.unique())
+    log.info(
+        "Usable months (%d): %s",
+        len(unique_months),
+        [pd.Timestamp(m).strftime("%Y-%m") for m in unique_months],
+    )
+
+    test_month = unique_months[-1]
+    cv_mask    = months < test_month
+    test_mask  = months == test_month
+
+    X_cv, y_cv, m_cv = X[cv_mask], y[cv_mask], months[cv_mask]
+    X_test, y_test   = X[test_mask], y[test_mask]
+    w_cv             = weights[cv_mask.values]
+
+    n_cv_months = m_cv.nunique()
+    n_splits    = max(1, min(MAX_CV_FOLDS, n_cv_months - 1))
+    log.info(
+        "Held-out test month: %s | CV folds: %d",
+        pd.Timestamp(test_month).strftime("%Y-%m"), n_splits,
+    )
+
+    # ── Grid search ───────────────────────────────────────────────────
+    log.info("=" * 55)
+    log.info("MODEL SEARCH  (time-series CV)")
+    log.info("=" * 55)
+
+    results = []
+    for name, est, grid in candidate_models():
+        log.info("Searching %s …", name)
+        if n_cv_months >= 2:
+            pipe, params, score = small_grid_search(
+                est, grid, X_cv, y_cv, m_cv, n_splits, w_cv,
+            )
+        else:
+            pipe = Pipeline([
+                ("preprocessor", make_preprocessor()),
+                ("model", clone(est)),
+            ])
+            pipe.fit(X_cv, y_cv)
+            params, score = {}, float("nan")
+        log.info("  best CV F1: %.4f  params: %s", score, params)
+        results.append((name, pipe, params, score))
+
+    results.sort(key=lambda r: r[3] if not np.isnan(r[3]) else -np.inf, reverse=True)
+    best_name,   best_pipe,   best_params, best_cv   = results[0]
+    second_name, second_pipe, _,           second_cv = (
+        results[1] if len(results) > 1 else (None, None, None, -np.inf)
+    )
+    log.info("Winner: %s (CV F1 = %.4f)", best_name, best_cv)
+
+    # Refit winner on full CV data
+    try:
+        best_pipe.fit(X_cv, y_cv, model__sample_weight=w_cv)
+    except TypeError:
+        best_pipe.fit(X_cv, y_cv)
+
+    # ── Threshold tuning ──────────────────────────────────────────────
+    if n_cv_months >= 2:
+        last_val_month = np.sort(m_cv.unique())[-1]
+        tr_m, va_m     = m_cv < last_val_month, m_cv == last_val_month
+        tune_pipe       = clone(best_pipe)
+        try:
+            tune_pipe.fit(X_cv[tr_m], y_cv[tr_m], model__sample_weight=w_cv[tr_m.values])
+        except TypeError:
+            tune_pipe.fit(X_cv[tr_m], y_cv[tr_m])
+        val_prob        = tune_pipe.predict_proba(X_cv[va_m])[:, 1]
+        best_t, best_f1 = 0.5, 0.0
+        for t in THRESHOLD_GRID:
+            sc = f1_score(y_cv[va_m], (val_prob >= t).astype(int), zero_division=0)
+            if sc > best_f1:
+                best_f1, best_t = sc, t
+        chosen_threshold = float(best_t)
+    else:
+        chosen_threshold = 0.5
+    log.info("Chosen decision threshold: %.2f", chosen_threshold)
+
+    # ── Ensemble (if runner-up is close) ─────────────────────────────
+    use_ensemble = (
+        second_pipe is not None
+        and not np.isnan(second_cv)
+        and (best_cv - second_cv) <= ENSEMBLE_MARGIN
+        and len(X_cv) >= 200
+    )
+    if use_ensemble:
+        try:
+            second_pipe.fit(X_cv, y_cv)
+        except Exception:
+            pass
+        final_for_calib = VotingClassifier(
+            estimators=[("first", best_pipe), ("second", second_pipe)],
+            voting="soft", weights=[1.0, 0.6],
+        )
+        final_for_calib.fit(X_cv, y_cv)
+        ensemble_label = f"Ensemble({best_name}+{second_name})"
+        log.info("Soft-voting ensemble: %s", ensemble_label)
+    else:
+        final_for_calib = best_pipe
+        ensemble_label  = best_name
+
+    # ── Calibration ───────────────────────────────────────────────────
+    n_rows = len(X_cv)
+    if n_rows >= MIN_ROWS_ISOTONIC and n_cv_months >= MIN_MONTHS_ISOTONIC:
+        methods = [("isotonic", 3), ("sigmoid", 3)]
+    elif n_rows >= MIN_ROWS_SIGMOID and n_cv_months >= MIN_MONTHS_SIGMOID:
+        methods = [("sigmoid", 3)]
+    else:
+        methods = []
+
+    final_pipeline     = final_for_calib
+    calibration_method = "none"
+    for method, cv_k in methods:
+        try:
+            cal = CalibratedClassifierCV(clone(final_for_calib), method=method, cv=cv_k)
+            cal.fit(X_cv, y_cv)
+            final_pipeline     = cal
+            calibration_method = method
+            log.info("Calibration: %s (cv=%d)", method, cv_k)
+            break
+        except Exception as e:
+            log.warning("Calibration %s failed: %s", method, e)
+    if calibration_method == "none":
+        log.info("Calibration skipped (%d rows, %d CV months).", n_rows, n_cv_months)
+
+    # ── Held-out test evaluation ──────────────────────────────────────
+    y_prob = final_pipeline.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= chosen_threshold).astype(int)
+
+    acc     = accuracy_score(y_test, y_pred)
+    bal_acc = balanced_accuracy_score(y_test, y_pred)
+    f1      = f1_score(y_test, y_pred, zero_division=0)
+    wf1     = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+    auc     = (
+        roc_auc_score(y_test, y_prob)
+        if len(np.unique(y_test)) > 1 else float("nan")
+    )
+
+    log.info("=" * 55)
+    log.info("HELD-OUT TEST — %s", pd.Timestamp(test_month).strftime("%Y-%m"))
+    log.info("=" * 55)
+    log.info("Accuracy:          %.4f", acc)
+    log.info("Balanced accuracy: %.4f", bal_acc)
+    log.info("F1 (binary):       %.4f", f1)
+    log.info("F1 (weighted):     %.4f", wf1)
+    log.info("ROC AUC:           %.4f", auc)
+    log.info("\nConfusion Matrix:\n%s", confusion_matrix(y_test, y_pred))
+    log.info("\nClassification Report:\n%s",
+             classification_report(y_test, y_pred, zero_division=0))
+
+    # ── Permutation importance ────────────────────────────────────────
+    log.info("Computing permutation feature importance …")
+    try:
+        perm   = permutation_importance(
+            best_pipe, X_test, y_test,
+            n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1, scoring="f1",
+        )
+        imp_df = pd.DataFrame({
+            "feature":    FEATURES,
+            "importance": perm.importances_mean,
+            "std":        perm.importances_std,
+        }).sort_values("importance", ascending=False)
+        log.info("Top 15 features:\n%s", imp_df.head(15).to_string(index=False))
+        _safe_write(imp_df, OUTPUT_DIR / "feature_importance.csv")
+    except Exception as e:
+        log.warning("Permutation importance skipped: %s", e)
+
+    # Save test fold predictions
+    test_result = train_df.loc[test_mask].copy()
+    test_result["pred_repeat_next_month"] = y_pred
+    test_result["repeat_probability"]     = y_prob
+    _safe_write(test_result, OUTPUT_DIR / "model_test_result.csv")
+
+    metadata = {
+        "winning_model":          ensemble_label,
+        "best_params":            best_params,
+        "cv_f1":                  float(best_cv) if not np.isnan(best_cv) else None,
+        "test_month":             pd.Timestamp(test_month).strftime("%Y-%m"),
+        "test_accuracy":          float(acc),
+        "test_balanced_accuracy": float(bal_acc),
+        "test_f1":                float(f1),
+        "test_f1_weighted":       float(wf1),
+        "test_roc_auc":           None if np.isnan(auc) else float(auc),
+        "chosen_threshold":       chosen_threshold,
+        "calibration_method":     calibration_method,
+        "target":                 TARGET,
+        "pattern_definition":     "route + type + position_bin",
+        "position_bin_size":      POSITION_BIN_SIZE,
+        "features":               FEATURES,
+        "categorical_features":   CATEGORICAL,
+        "new_features_v6":        [
+            "resolution_hours (avg/max/prev)",
+            "unresolved_share + roll3_unresolved",
+            "dominant_status (C4)",
+            "dominant_fibre (C5)",
+        ],
+        "trainer_version":        "v6",
+        "cold_start":             False,
+    }
+
+    return final_pipeline, metadata, chosen_threshold
+
+
+# ──────────────────────────────────────────────
+# NEXT-MONTH PREDICTION
+# ──────────────────────────────────────────────
+def predict_next_month(
+    pipeline, full_monthly: pd.DataFrame, threshold: float
+) -> pd.DataFrame:
+    latest_month = full_monthly["month"].max()
+    latest       = full_monthly[full_monthly["month"] == latest_month].copy()
+    if latest.empty:
+        return pd.DataFrame()
+
+    is_cold_start = isinstance(pipeline, ColdStartPredictor)
+
+    for col in FEATURES:
+        if col not in latest.columns:
+            latest[col] = 0
+
+    if is_cold_start:
+        latest["repeat_probability"]     = pipeline.predict_proba(latest)[:, 1]
+        latest["pred_repeat_next_month"] = pipeline.predict(latest)
+    else:
+        X_next = latest[FEATURES].copy()
+        latest["repeat_probability"]     = pipeline.predict_proba(X_next)[:, 1]
+        latest["pred_repeat_next_month"] = (
+            latest["repeat_probability"] >= threshold
+        ).astype(int)
+
+    latest["risk_level"] = pd.cut(
+        latest["repeat_probability"],
+        bins=[-0.01, 0.40, 0.70, 1.00],
+        labels=["Low", "Medium", "High"],
+    )
+
+    latest["position_range"] = latest["position_bin"].apply(
+        lambda b: _pos_range_label(int(b), POSITION_BIN_SIZE)
+    )
+
+    next_month_ts = latest_month + pd.DateOffset(months=1)
+    latest["predicted_month"] = next_month_ts.strftime("%Y-%m")
+
+    cols = [
+        "route", "type", "position_range",
+        "month", "predicted_month",
+        "alarm_count", "accident_count", "alarm_share",
+        "unresolved_count", "unresolved_share",
+        "avg_resolution_hrs", "max_resolution_hrs",
+        "dominant_status", "dominant_fibre",
+        "prev_month_count", "past_total_count",
+        "past_months_active", "past_avg_count",
+        "avg_threat_score", "distinct_markers",
+        "repeat_probability", "risk_level", "pred_repeat_next_month",
+        "avg_lat", "avg_lon",
+    ]
+    cols = [c for c in cols if c in latest.columns]
+    return latest[cols].sort_values("repeat_probability", ascending=False)
+
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+def main():
+    t0 = time.time()
+
+    raw_df = load_data_from_db()
+    df     = prepare_data(raw_df)
+
+    log.info("Unique months: %d", df["month"].dt.strftime("%Y-%m").nunique())
+
+    train_df, full_monthly = build_monthly_table(df)
+    log.info("Monthly pattern rows for training: %d", len(train_df))
+    log.info(
+        "Target distribution:\n%s",
+        train_df[TARGET].value_counts(dropna=False).to_string(),
+    )
+
+    # Cold-start guard
+    if train_df.empty:
+        log.warning(
+            "Only 1 month of data — using ColdStartPredictor. "
+            "Collect ≥2 months for a proper ML model."
+        )
+        predictor = ColdStartPredictor(threshold=0.5)
+        predictor.fit(full_monthly)
+        metadata = {
+            "winning_model":          "ColdStartPredictor",
+            "trainer_version":        "v6",
+            "cold_start":             True,
+            "chosen_threshold":       0.5,
+            "calibration_method":     "none",
+            "target":                 TARGET,
+            "pattern_definition":     "route + type + position_bin",
+            "position_bin_size":      POSITION_BIN_SIZE,
+            "features":               FEATURES,
+            "categorical_features":   CATEGORICAL,
+        }
+        pipeline, threshold = predictor, 0.5
+    else:
+        pipeline, metadata, threshold = train_model(train_df)
+
+    # ── Save model ────────────────────────────────────────────────────
+    model_path = OUTPUT_DIR / "repeated_alarm_model.joblib"
+    try:
+        joblib.dump(pipeline, model_path)
+        log.info("Model saved: %s", model_path)
+    except PermissionError:
+        alt = model_path.with_name(
+            f"{model_path.stem}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}{model_path.suffix}"
+        )
+        joblib.dump(pipeline, alt)
+        log.warning("PermissionError — model saved as %s", alt.name)
+        model_path = alt
+
+    # ── Save metadata ─────────────────────────────────────────────────
+    meta_path = OUTPUT_DIR / "repeated_alarm_metadata.json"
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4, default=str)
+        log.info("Metadata saved: %s", meta_path)
+    except PermissionError:
+        alt = meta_path.with_name(
+            f"{meta_path.stem}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}{meta_path.suffix}"
+        )
+        with open(alt, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4, default=str)
+        log.warning("PermissionError — metadata saved as %s", alt.name)
+
+    # ── Save next-month predictions ───────────────────────────────────
+    next_month_result = predict_next_month(pipeline, full_monthly, threshold)
+    out_path = _safe_write(
+        next_month_result,
+        OUTPUT_DIR / "next_month_repeated_alarm_prediction.csv",
+    )
+    log.info("Next-month prediction saved: %s", out_path)
+
+    log.info("=" * 55)
+    log.info("Top 10 predicted repeated alarms next month:")
+    if next_month_result.empty:
+        log.info("  (no results)")
+    else:
+        display_cols = [
+            "route", "type", "position_range",
+            "alarm_count", "unresolved_share",
+            "avg_resolution_hrs", "repeat_probability", "risk_level",
+        ]
+        display_cols = [c for c in display_cols if c in next_month_result.columns]
+        log.info("\n%s", next_month_result.head(10)[display_cols].to_string(index=False))
+
+    log.info("Done in %.1f s", time.time() - t0)
+
+
+if __name__ == "__main__":
+    main()
