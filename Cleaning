@@ -1,0 +1,312 @@
+"""
+ETL Script: Load January and February CSV files into existing PostgreSQL table.
+
+Important:
+- Files are read from C:\\Users\\Admin\\Downloads
+- This script does NOT create alarm_data table
+- Time will NOT be converted to UTC
+- If CSV says 14:05:29, database stores 14:05:29
+- This script does NOT use ON CONFLICT
+- This script does NOT insert record_id
+- Amber rows will be deleted from database
+"""
+
+import os
+import pandas as pd
+from sqlalchemy import create_engine, text
+from pathlib import Path
+
+# ─────────────────────────────────────────────
+# 1. Database connection
+# ─────────────────────────────────────────────
+DB_URL = os.getenv("DAS_DB_URL")
+if not DB_URL:
+    raise RuntimeError(
+        "DAS_DB_URL is not set. "
+        "PowerShell example: $env:DAS_DB_URL = 'postgresql://USER:PASSWORD@HOST:5432/DBNAME'"
+    )
+engine = create_engine(DB_URL)
+
+# ─────────────────────────────────────────────
+# 2. CSV files location
+# ─────────────────────────────────────────────
+BASE = Path(r"C:\Users\Admin\Downloads")
+
+FILES = [
+    BASE / "January.csv",
+    BASE / "February.csv",
+    BASE / "march.csv",
+    BASE / "april.csv",
+    BASE / "may.csv",
+]
+
+# ─────────────────────────────────────────────
+# 3. Columns from CSV
+# ─────────────────────────────────────────────
+KEEP_COLS = [
+    "ID",
+    "Time",
+    "Type",
+    "Status",
+    "Threat level",
+    "Resolved on",
+    "Fibre Line",
+    "Position (m)",
+    "Latitude",
+    "Longitude",
+    "Route",
+    "Route distance (m)",
+    "Marker name",
+]
+
+# Do NOT include record_id here
+DB_COLS = [
+    "id",
+    "time",
+    "type",
+    "status",
+    "threat_level",
+    "resolved_on",
+    "fibre_line",
+    "position_m",
+    "latitude",
+    "longitude",
+    "route",
+    "route_distance_m",
+    "marker_name",
+    "occurrence_type",
+]
+
+# ─────────────────────────────────────────────
+# 4. Timestamp parser
+# ─────────────────────────────────────────────
+def parse_timestamp(series: pd.Series) -> pd.Series:
+    """
+    Keep original clock time from CSV.
+
+    Example:
+    CSV: 2026-01-01 14:05:29+08:00
+    DB:  2026-01-01 14:05:29
+
+    It removes +08:00 but does not convert/minus 8 hours.
+    """
+    s = series.astype(str).str.strip()
+
+    # Remove timezone suffix like +08:00 or -05:00
+    s = s.str.replace(r"\s*[+-]\d{2}:\d{2}$", "", regex=True)
+
+    # Remove Z if exists
+    s = s.str.replace(r"\s*Z$", "", regex=True)
+
+    return pd.to_datetime(s, errors="coerce", dayfirst=False)
+
+
+# ─────────────────────────────────────────────
+# 5. Clean one CSV file
+# ─────────────────────────────────────────────
+def clean_df(path: Path) -> pd.DataFrame:
+    print(f"Reading: {path}")
+
+    df = pd.read_csv(path, dtype=str)
+
+    # Remove ghost columns like Unnamed: 0
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    # Keep only needed columns
+    cols_present = [c for c in KEEP_COLS if c in df.columns]
+    df = df[cols_present].copy()
+
+    # Rename CSV columns to database columns
+    rename_map = {
+        "ID": "id",
+        "Time": "time",
+        "Type": "type",
+        "Status": "status",
+        "Threat level": "threat_level",
+        "Resolved on": "resolved_on",
+        "Fibre Line": "fibre_line",
+        "Position (m)": "position_m",
+        "Latitude": "latitude",
+        "Longitude": "longitude",
+        "Route": "route",
+        "Route distance (m)": "route_distance_m",
+        "Marker name": "marker_name",
+    }
+
+    df.rename(columns=rename_map, inplace=True)
+
+    # occurrence_type uses same value as type
+    df["occurrence_type"] = df["type"]
+
+    # Clean ID
+    df["id"] = df["id"].astype(str).str.strip()
+
+    # Parse time without UTC conversion
+    df["time"] = parse_timestamp(df["time"])
+
+    if "resolved_on" in df.columns:
+        df["resolved_on"] = parse_timestamp(df["resolved_on"])
+    else:
+        df["resolved_on"] = None
+
+    # Convert numeric columns
+    for col in ["position_m", "latitude", "longitude", "route_distance_m"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Clean text columns
+    text_cols = [
+        "id",
+        "type",
+        "status",
+        "threat_level",
+        "fibre_line",
+        "route",
+        "marker_name",
+        "occurrence_type",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].replace({
+                "nan": None,
+                "NaN": None,
+                "None": None,
+                "": None,
+            })
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# 6. Load and merge CSV files
+# ─────────────────────────────────────────────
+frames = []
+
+for file in FILES:
+    if file.exists():
+        frames.append(clean_df(file))
+    else:
+        print(f"⚠️ File not found: {file}")
+
+if not frames:
+    raise FileNotFoundError("No CSV files found. Check your file names and folder.")
+
+merged = pd.concat(frames, ignore_index=True)
+
+# ─────────────────────────────────────────────
+# 7. Remove duplicates
+# ─────────────────────────────────────────────
+before = len(merged)
+
+merged.drop_duplicates(inplace=True)
+
+# Keep only one row per id
+merged = merged.drop_duplicates(subset=["id"], keep="last")
+
+after = len(merged)
+
+print(f"Rows before dedup: {before}")
+print(f"Rows after dedup:  {after}")
+print(f"Removed:           {before - after}")
+
+# ─────────────────────────────────────────────
+# 8. Prepare data for PostgreSQL
+# ─────────────────────────────────────────────
+db_cols_present = [c for c in DB_COLS if c in merged.columns]
+load_df = merged[db_cols_present].copy()
+
+# Replace NaN with None so PostgreSQL stores NULL
+load_df = load_df.where(pd.notnull(load_df), None)
+
+# ─────────────────────────────────────────────
+# 9. Load to staging table
+# ─────────────────────────────────────────────
+STAGE = "alarm_data_staging"
+
+load_df.to_sql(
+    STAGE,
+    engine,
+    if_exists="replace",
+    index=False,
+)
+
+print(f"Loaded {len(load_df)} rows into staging table.")
+
+# ─────────────────────────────────────────────
+# 10. Replace existing rows with same id, then insert
+#     This works even if id is NOT primary key
+# ─────────────────────────────────────────────
+insert_cols = ", ".join(db_cols_present)
+select_cols = ", ".join(db_cols_present)
+
+replace_sql = f"""
+DELETE FROM alarm_data a
+USING {STAGE} s
+WHERE a.id = s.id;
+
+INSERT INTO alarm_data ({insert_cols})
+SELECT {select_cols}
+FROM {STAGE};
+"""
+
+with engine.begin() as conn:
+    conn.execute(text(replace_sql))
+    conn.execute(text(f"DROP TABLE IF EXISTS {STAGE}"))
+
+print("Existing rows replaced and new rows inserted.")
+
+# ─────────────────────────────────────────────
+# 11. Delete Amber rows
+# ─────────────────────────────────────────────
+with engine.begin() as conn:
+    amber_before = conn.execute(text("""
+        SELECT COUNT(*)
+        FROM alarm_data
+        WHERE LOWER(TRIM(threat_level)) = 'amber';
+    """)).scalar()
+
+    conn.execute(text("""
+        DELETE FROM alarm_data
+        WHERE LOWER(TRIM(threat_level)) = 'amber';
+    """))
+
+    amber_after = conn.execute(text("""
+        SELECT COUNT(*)
+        FROM alarm_data
+        WHERE LOWER(TRIM(threat_level)) = 'amber';
+    """)).scalar()
+
+print(f"Amber rows before delete: {amber_before}")
+print(f"Amber rows after delete:  {amber_after}")
+
+# ─────────────────────────────────────────────
+# 12. Final summary
+# ─────────────────────────────────────────────
+with engine.connect() as conn:
+    total_count = conn.execute(text("""
+        SELECT COUNT(*)
+        FROM alarm_data;
+    """)).scalar()
+
+    red_count = conn.execute(text("""
+        SELECT COUNT(*)
+        FROM alarm_data
+        WHERE LOWER(TRIM(threat_level)) = 'red';
+    """)).scalar()
+
+    min_time = conn.execute(text("""
+        SELECT MIN(time)
+        FROM alarm_data;
+    """)).scalar()
+
+    max_time = conn.execute(text("""
+        SELECT MAX(time)
+        FROM alarm_data;
+    """)).scalar()
+
+print("\n✅ Done!")
+print(f"Total rows in alarm_data: {total_count}")
+print(f"Red rows:                 {red_count}")
+print(f"Date range:               {min_time} → {max_time}")
